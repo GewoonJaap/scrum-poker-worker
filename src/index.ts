@@ -117,7 +117,10 @@ export class PokerRoom {
     socket.addEventListener("close", (event) => {
         console.log(`[${this.state.id.toString()}] Socket closed for user ${userId}. Code: ${event.code}, Reason: ${event.reason}`);
         this.sessions = this.sessions.filter(s => s.socket !== socket);
-        delete this.users[userId];
+        // Only remove user if they have no other open sessions
+        if (!this.sessions.some(s => s.userId === userId)) {
+          delete this.users[userId];
+        }
         this.broadcastState();
     });
 
@@ -126,46 +129,62 @@ export class PokerRoom {
     });
   }
 
-  broadcastState() {
+  broadcastState(message?: string) {
+    if (!message) {
       const state = {
-          type: 'state',
-          users: Object.values(this.users),
-          revealed: this.revealed,
+        type: 'state',
+        users: Object.values(this.users),
+        revealed: this.revealed,
       };
-      const message = JSON.stringify(state);
-      console.log(`[${this.state.id.toString()}] Broadcasting state to ${this.sessions.length} clients`);
-      
-      const stillConnectedSessions: Session[] = [];
-      this.sessions.forEach(session => {
-          try {
-              session.socket.send(message);
-              stillConnectedSessions.push(session);
-          } catch (e) {
-              console.error(`[${this.state.id.toString()}] Failed to send to user ${session.userId}, removing session.`, e);
-              // This session is dead. Clean up the user associated with it.
-              delete this.users[session.userId];
-          }
+      message = JSON.stringify(state);
+    }
+
+    console.log(`[${this.state.id.toString()}] Broadcasting state to ${this.sessions.length} clients`);
+    
+    const deadSessions: Session[] = [];
+    this.sessions.forEach(session => {
+      try {
+        session.socket.send(message!);
+      } catch (e) {
+        console.error(`[${this.state.id.toString()}] Failed to send to user ${session.userId}, marking session for removal.`, e);
+        deadSessions.push(session);
+      }
+    });
+
+    if (deadSessions.length > 0) {
+      this.sessions = this.sessions.filter(s => !deadSessions.includes(s));
+      deadSessions.forEach(s => {
+        // Only delete the user if no other active sessions for that user exist.
+        const userHasOtherSessions = this.sessions.some(active => active.userId === s.userId);
+        if (!userHasOtherSessions) {
+          console.log(`[${this.state.id.toString()}] Removing user ${s.userId} due to dead socket.`);
+          delete this.users[s.userId];
+        }
       });
-      this.sessions = stillConnectedSessions;
+
+      // Since the user list changed, we must broadcast the new state to the remaining clients.
+      console.log(`[${this.state.id.toString()}] ${deadSessions.length} sessions were disconnected. Re-broadcasting state.`);
+      this.broadcastState(); // Re-call to create and broadcast a fresh state message.
+    }
   }
 }
 
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    let url = new URL(request.url);
-    let roomId = url.pathname.slice(1);
+    const url = new URL(request.url);
+    const path = url.pathname;
 
-    // Enforce a roomId
-    if (!roomId) {
-      roomId = crypto.randomUUID();
-      return Response.redirect(`${url.origin}/${roomId}${url.search}`, 302);
+    const match = path.match(/^\/room\/([a-zA-Z0-9]+)$/);
+
+    if (!match) {
+        return new Response("Not Found. Expected URL format: /room/<ROOM_CODE>", { status: 404 });
     }
 
-    let id = env.POKER_ROOM.idFromName(roomId);
-    let stub = env.POKER_ROOM.get(id);
+    const roomCode = match[1].toUpperCase();
+    const id = env.POKER_ROOM.idFromName(roomCode);
+    const stub = env.POKER_ROOM.get(id);
 
-    // Pass the request to the Durable Object.
     return await stub.fetch(request);
   },
 } satisfies ExportedHandler<Env>;
